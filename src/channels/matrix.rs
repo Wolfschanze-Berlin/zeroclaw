@@ -13,6 +13,7 @@ use matrix_sdk::{
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
@@ -24,11 +25,22 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
-    session_user_id_hint: Option<String>,
+    session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
+    zeroclaw_dir: Option<PathBuf>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
     http_client: Client,
+}
+
+impl std::fmt::Debug for MatrixChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixChannel")
+            .field("homeserver", &self.homeserver)
+            .field("room_id", &self.room_id)
+            .field("allowed_users", &self.allowed_users)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,8 +120,28 @@ impl MatrixChannel {
         access_token: String,
         room_id: String,
         allowed_users: Vec<String>,
-        user_id_hint: Option<String>,
+        owner_hint: Option<String>,
         device_id_hint: Option<String>,
+    ) -> Self {
+        Self::new_with_session_hint_and_zeroclaw_dir(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            owner_hint,
+            device_id_hint,
+            None,
+        )
+    }
+
+    pub fn new_with_session_hint_and_zeroclaw_dir(
+        homeserver: String,
+        access_token: String,
+        room_id: String,
+        allowed_users: Vec<String>,
+        owner_hint: Option<String>,
+        device_id_hint: Option<String>,
+        zeroclaw_dir: Option<PathBuf>,
     ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
@@ -125,8 +157,9 @@ impl MatrixChannel {
             access_token,
             room_id,
             allowed_users,
-            session_user_id_hint: Self::normalize_optional_field(user_id_hint),
+            session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
+            zeroclaw_dir,
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
             http_client: Client::new(),
@@ -156,6 +189,12 @@ impl MatrixChannel {
 
     fn auth_header_value(&self) -> String {
         format!("Bearer {}", self.access_token)
+    }
+
+    fn matrix_store_dir(&self) -> Option<PathBuf> {
+        self.zeroclaw_dir
+            .as_ref()
+            .map(|dir| dir.join("state").join("matrix"))
     }
 
     fn is_user_allowed(&self, sender: &str) -> bool {
@@ -245,7 +284,7 @@ impl MatrixChannel {
                 let whoami = match identity {
                     Ok(whoami) => Some(whoami),
                     Err(error) => {
-                        if self.session_user_id_hint.is_some() && self.session_device_id_hint.is_some()
+                        if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
                         {
                             tracing::warn!(
                                 "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
@@ -258,18 +297,18 @@ impl MatrixChannel {
                 };
 
                 let resolved_user_id = if let Some(whoami) = whoami.as_ref() {
-                    if let Some(hinted) = self.session_user_id_hint.as_ref() {
+                    if let Some(hinted) = self.session_owner_hint.as_ref() {
                         if hinted != &whoami.user_id {
                             tracing::warn!(
                                 "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
-                                hinted,
-                                whoami.user_id
+                                crate::security::redact(hinted),
+                                crate::security::redact(&whoami.user_id)
                             );
                         }
                     }
                     whoami.user_id.clone()
                 } else {
-                    self.session_user_id_hint.clone().ok_or_else(|| {
+                    self.session_owner_hint.clone().ok_or_else(|| {
                         anyhow::anyhow!(
                             "Matrix session restore requires user_id when whoami is unavailable"
                         )
@@ -282,8 +321,8 @@ impl MatrixChannel {
                             if whoami_device_id != hinted {
                                 tracing::warn!(
                                     "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
-                                    hinted,
-                                    whoami_device_id
+                                    crate::security::redact(hinted),
+                                    crate::security::redact(whoami_device_id)
                                 );
                             }
                             whoami_device_id.clone()
@@ -304,10 +343,19 @@ impl MatrixChannel {
                     }
                 };
 
-                let client = MatrixSdkClient::builder()
-                    .homeserver_url(&self.homeserver)
-                    .build()
-                    .await?;
+                let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
+
+                if let Some(store_dir) = self.matrix_store_dir() {
+                    tokio::fs::create_dir_all(&store_dir).await.map_err(|error| {
+                        anyhow::anyhow!(
+                            "Matrix failed to initialize persistent store directory at '{}': {error}",
+                            store_dir.display()
+                        )
+                    })?;
+                    client_builder = client_builder.sqlite_store(&store_dir, None);
+                }
+
+                let client = client_builder.build().await?;
 
                 let user_id: OwnedUserId = resolved_user_id.parse()?;
                 let session = MatrixSession {
@@ -438,6 +486,40 @@ impl MatrixChannel {
         })
         .to_string()
     }
+
+    async fn log_e2ee_diagnostics(&self, client: &MatrixSdkClient) {
+        match client.encryption().get_own_device().await {
+            Ok(Some(device)) => {
+                if device.is_verified() {
+                    tracing::info!(
+                        "Matrix device '{}' is verified for E2EE.",
+                        device.device_id()
+                    );
+                } else {
+                    tracing::warn!(
+                        "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
+                        device.device_id()
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Matrix own-device metadata is unavailable; verify/signing status cannot be determined."
+                );
+            }
+            Err(error) => {
+                tracing::warn!("Matrix own-device verification check failed: {error}");
+            }
+        }
+
+        if client.encryption().backups().are_enabled().await {
+            tracing::info!("Matrix room-key backup is enabled for this device.");
+        } else {
+            tracing::warn!(
+                "Matrix room-key backup is not enabled for this device; `matrix_sdk_crypto::backups` warnings about missing backup keys may appear until recovery is configured."
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -465,7 +547,7 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
-        room.send(RoomMessageEventContent::text_plain(&message.content))
+        room.send(RoomMessageEventContent::text_markdown(&message.content))
             .await?;
 
         Ok(())
@@ -479,7 +561,7 @@ impl Channel for MatrixChannel {
         let my_user_id: OwnedUserId = match self.get_my_user_id().await {
             Ok(user_id) => user_id.parse()?,
             Err(error) => {
-                if let Some(hinted) = self.session_user_id_hint.as_ref() {
+                if let Some(hinted) = self.session_owner_hint.as_ref() {
                     tracing::warn!(
                         "Matrix whoami failed while resolving listener user_id; using configured user_id hint: {error}"
                     );
@@ -490,6 +572,8 @@ impl Channel for MatrixChannel {
             }
         };
         let client = self.matrix_client().await?;
+
+        self.log_e2ee_diagnostics(&client).await;
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
@@ -560,6 +644,7 @@ impl Channel for MatrixChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
+                    thread_ts: None,
                 };
 
                 let _ = tx.send(msg).await;
@@ -678,7 +763,7 @@ mod tests {
             Some("  DEVICE123  ".to_string()),
         );
 
-        assert_eq!(ch.session_user_id_hint.as_deref(), Some("@bot:matrix.org"));
+        assert_eq!(ch.session_owner_hint.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(ch.session_device_id_hint.as_deref(), Some("DEVICE123"));
     }
 
@@ -690,11 +775,43 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             Some("   ".to_string()),
-            Some("".to_string()),
+            Some(String::new()),
         );
 
-        assert!(ch.session_user_id_hint.is_none());
+        assert!(ch.session_owner_hint.is_none());
         assert!(ch.session_device_id_hint.is_none());
+    }
+
+    #[test]
+    fn matrix_store_dir_is_derived_from_zeroclaw_dir() {
+        let ch = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+            Some(PathBuf::from("/tmp/zeroclaw")),
+        );
+
+        assert_eq!(
+            ch.matrix_store_dir(),
+            Some(PathBuf::from("/tmp/zeroclaw/state/matrix"))
+        );
+    }
+
+    #[test]
+    fn matrix_store_dir_absent_without_zeroclaw_dir() {
+        let ch = MatrixChannel::new_with_session_hint(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+        );
+
+        assert!(ch.matrix_store_dir().is_none());
     }
 
     #[test]
@@ -723,6 +840,20 @@ mod tests {
         assert!(MatrixChannel::has_non_empty_body("  hello  "));
         assert!(!MatrixChannel::has_non_empty_body(""));
         assert!(!MatrixChannel::has_non_empty_body("   \n\t  "));
+    }
+
+    #[test]
+    fn send_content_uses_markdown_formatting() {
+        let content = RoomMessageEventContent::text_markdown("**hello**");
+        let value = serde_json::to_value(content).unwrap();
+
+        assert_eq!(value["msgtype"], "m.text");
+        assert_eq!(value["body"], "**hello**");
+        assert_eq!(value["format"], "org.matrix.custom.html");
+        assert!(value["formatted_body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("<strong>hello</strong>"));
     }
 
     #[test]

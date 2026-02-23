@@ -11,6 +11,85 @@ use uuid::Uuid;
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
+fn ensure_https(url: &str) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
+    }
+    Ok(())
+}
+
+fn is_image_filename(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".heic")
+        || lower.ends_with(".heif")
+        || lower.ends_with(".svg")
+}
+
+fn extract_image_marker_from_attachment(attachment: &serde_json::Value) -> Option<String> {
+    let url = attachment.get("url").and_then(|u| u.as_str())?.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    let content_type = attachment
+        .get("content_type")
+        .and_then(|ct| ct.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let filename = attachment
+        .get("filename")
+        .and_then(|f| f.as_str())
+        .unwrap_or("");
+    let is_image = content_type.starts_with("image/") || is_image_filename(filename);
+
+    if !is_image {
+        return None;
+    }
+
+    Some(format!("[IMAGE:{url}]"))
+}
+
+fn compose_message_content(payload: &serde_json::Value) -> Option<String> {
+    let text = payload
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let image_markers: Vec<String> = payload
+        .get("attachments")
+        .and_then(|a| a.as_array())
+        .map(|attachments| {
+            attachments
+                .iter()
+                .filter_map(extract_image_marker_from_attachment)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if text.is_empty() && image_markers.is_empty() {
+        return None;
+    }
+
+    if text.is_empty() {
+        return Some(image_markers.join("\n"));
+    }
+
+    if image_markers.is_empty() {
+        return Some(text.to_string());
+    }
+
+    Some(format!("{text}\n\n{}", image_markers.join("\n")))
+}
+
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
 
@@ -183,10 +262,14 @@ impl Channel for QQChannel {
                 }),
             )
         } else {
-            let user_id = message
+            let raw_uid = message
                 .recipient
                 .strip_prefix("user:")
                 .unwrap_or(&message.recipient);
+            let user_id: String = raw_uid
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
                 json!({
@@ -195,6 +278,8 @@ impl Channel for QQChannel {
                 }),
             )
         };
+
+        ensure_https(&url)?;
 
         let resp = self
             .http_client()
@@ -252,7 +337,9 @@ impl Channel for QQChannel {
                 }
             }
         });
-        write.send(Message::Text(identify.to_string())).await?;
+        write
+            .send(Message::Text(identify.to_string().into()))
+            .await?;
 
         tracing::info!("QQ: connected and identified");
 
@@ -276,7 +363,11 @@ impl Channel for QQChannel {
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
-                    if write.send(Message::Text(hb.to_string())).await.is_err() {
+                    if write
+                        .send(Message::Text(hb.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -287,7 +378,7 @@ impl Channel for QQChannel {
                         _ => continue,
                     };
 
-                    let event: serde_json::Value = match serde_json::from_str(&msg) {
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -304,7 +395,11 @@ impl Channel for QQChannel {
                         1 => {
                             let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                             let hb = json!({"op": 1, "d": d});
-                            if write.send(Message::Text(hb.to_string())).await.is_err() {
+                            if write
+                                .send(Message::Text(hb.to_string().into()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;
@@ -340,10 +435,9 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
-                            if content.is_empty() {
+                            let Some(content) = compose_message_content(d) else {
                                 continue;
-                            }
+                            };
 
                             let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
                             // For QQ, user_openid is the identifier
@@ -360,12 +454,13 @@ impl Channel for QQChannel {
                                 id: Uuid::new_v4().to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
-                                content: content.to_string(),
+                                content,
                                 channel: "qq".to_string(),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -379,10 +474,9 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
-                            if content.is_empty() {
+                            let Some(content) = compose_message_content(d) else {
                                 continue;
-                            }
+                            };
 
                             let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
 
@@ -398,12 +492,13 @@ impl Channel for QQChannel {
                                 id: Uuid::new_v4().to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
-                                content: content.to_string(),
+                                content,
                                 channel: "qq".to_string(),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -428,6 +523,7 @@ impl Channel for QQChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_name() {
@@ -481,5 +577,94 @@ allowed_users = ["user1"]
         assert_eq!(config.app_id, "12345");
         assert_eq!(config.app_secret, "secret_abc");
         assert_eq!(config.allowed_users, vec!["user1"]);
+    }
+
+    #[test]
+    fn test_compose_message_content_text_only() {
+        let payload = json!({
+            "content": "  hello world  "
+        });
+
+        assert_eq!(
+            compose_message_content(&payload),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_message_content_attachment_only_image() {
+        let payload = json!({
+            "content": "   ",
+            "attachments": [
+                {
+                    "content_type": "image/jpg",
+                    "url": "https://cdn.example.com/a.jpg"
+                }
+            ]
+        });
+
+        assert_eq!(
+            compose_message_content(&payload),
+            Some("[IMAGE:https://cdn.example.com/a.jpg]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_message_content_text_and_image_attachments() {
+        let payload = json!({
+            "content": "Here is an image",
+            "attachments": [
+                {
+                    "content_type": "image/png",
+                    "url": "https://cdn.example.com/a.png"
+                },
+                {
+                    "filename": "b.jpeg",
+                    "url": "https://cdn.example.com/b.jpeg"
+                }
+            ]
+        });
+
+        assert_eq!(
+            compose_message_content(&payload),
+            Some(
+                "Here is an image\n\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:https://cdn.example.com/b.jpeg]"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_compose_message_content_ignores_non_image_attachments() {
+        let payload = json!({
+            "content": "text",
+            "attachments": [
+                {
+                    "content_type": "application/pdf",
+                    "url": "https://cdn.example.com/a.pdf"
+                }
+            ]
+        });
+
+        assert_eq!(compose_message_content(&payload), Some("text".to_string()));
+    }
+
+    #[test]
+    fn test_compose_message_content_drops_empty_without_valid_attachments() {
+        let payload = json!({
+            "content": "   ",
+            "attachments": [
+                {
+                    "content_type": "application/pdf",
+                    "url": "https://cdn.example.com/a.pdf"
+                },
+                {
+                    "content_type": "image/png",
+                    "url": "   "
+                }
+            ]
+        });
+
+        assert_eq!(compose_message_content(&payload), None);
     }
 }

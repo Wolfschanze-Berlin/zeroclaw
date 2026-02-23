@@ -2,9 +2,21 @@ name: Sec Audit
 
 on:
     push:
-        branches: [main]
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "deny.toml"
     pull_request:
-        branches: [main]
+        branches: [dev, main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "crates/**"
+            - "deny.toml"
     schedule:
         - cron: "0 6 * * 1" # Weekly on Monday 6am UTC
 

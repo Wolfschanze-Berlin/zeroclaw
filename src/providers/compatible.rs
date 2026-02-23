@@ -2,9 +2,11 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
+    ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -22,10 +24,15 @@ pub struct OpenAiCompatibleProvider {
     pub(crate) base_url: String,
     pub(crate) credential: Option<String>,
     pub(crate) auth_header: AuthStyle,
+    supports_vision: bool,
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
     supports_responses_fallback: bool,
     user_agent: Option<String>,
+    /// When true, collect all `system` messages and prepend their content
+    /// to the first `user` message, then drop the system messages.
+    /// Required for providers that reject `role: system` (e.g. MiniMax).
+    merge_system_into_user: bool,
 }
 
 /// How the provider expects the API key to be sent.
@@ -46,7 +53,28 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(name, base_url, credential, auth_style, true, None)
+        Self::new_with_options(
+            name, base_url, credential, auth_style, false, true, None, false,
+        )
+    }
+
+    pub fn new_with_vision(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            true,
+            None,
+            false,
+        )
     }
 
     /// Same as `new` but skips the /v1/responses fallback on 404.
@@ -57,7 +85,9 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(name, base_url, credential, auth_style, false, None)
+        Self::new_with_options(
+            name, base_url, credential, auth_style, false, false, None, false,
+        )
     }
 
     /// Create a provider with a custom User-Agent header.
@@ -76,8 +106,43 @@ impl OpenAiCompatibleProvider {
             base_url,
             credential,
             auth_style,
+            false,
             true,
             Some(user_agent),
+            false,
+        )
+    }
+
+    pub fn new_with_user_agent_and_vision(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        user_agent: &str,
+        supports_vision: bool,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            true,
+            Some(user_agent),
+            false,
+        )
+    }
+
+    /// For providers that do not support `role: system` (e.g. MiniMax).
+    /// System prompt content is prepended to the first user message instead.
+    pub fn new_merge_system_into_user(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
+        Self::new_with_options(
+            name, base_url, credential, auth_style, false, false, None, true,
         )
     }
 
@@ -86,17 +151,52 @@ impl OpenAiCompatibleProvider {
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
+        supports_vision: bool,
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
+        merge_system_into_user: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
+            supports_vision,
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
+            merge_system_into_user,
         }
+    }
+
+    /// Collect all `system` role messages, concatenate their content,
+    /// and prepend to the first `user` message. Drop all system messages.
+    /// Used for providers (e.g. MiniMax) that reject `role: system`.
+    fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let system_content: String = messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        if system_content.is_empty() {
+            return messages.to_vec();
+        }
+
+        let mut result: Vec<ChatMessage> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .cloned()
+            .collect();
+
+        if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
+            first_user.content = format!("{system_content}\n\n{}", first_user.content);
+        } else {
+            // No user message found: insert a synthetic user message with system content
+            result.insert(0, ChatMessage::user(&system_content));
+        }
+
+        result
     }
 
     fn http_client(&self) -> Client {
@@ -217,17 +317,70 @@ struct ApiChatRequest {
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: MessageContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<MessagePart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessagePart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlPart },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrlPart {
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+}
+
+/// Remove `<think>...</think>` blocks from model output.
+/// Some reasoning models (e.g. MiniMax) embed their chain-of-thought inline
+/// in the `content` field rather than a separate `reasoning_content` field.
+/// The resulting `<think>` tags must be stripped before returning to the user.
+fn strip_think_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -246,18 +399,35 @@ impl ResponseMessage {
     /// Extract text content, falling back to `reasoning_content` when `content`
     /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
     /// often return their output solely in `reasoning_content`.
+    /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
+    /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
+        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+            let stripped = strip_think_tags(content);
+            if !stripped.is_empty() {
+                return stripped;
+            }
         }
+
+        self.reasoning_content
+            .as_ref()
+            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_default()
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone().filter(|c| !c.is_empty()),
+        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+            let stripped = strip_think_tags(content);
+            if !stripped.is_empty() {
+                return Some(stripped);
+            }
         }
+
+        self.reasoning_content
+            .as_ref()
+            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
     }
 }
 
@@ -266,13 +436,60 @@ struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(rename = "type")]
+    #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
     function: Option<Function>,
+
+    // Compatibility: Some providers (e.g., older GLM) may use 'name' directly
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+
+    // Compatibility: DeepSeek sometimes wraps arguments differently
+    #[serde(rename = "parameters", default)]
+    parameters: Option<serde_json::Value>,
+}
+
+impl ToolCall {
+    /// Extract function name with fallback logic for various provider formats
+    fn function_name(&self) -> Option<String> {
+        // Standard OpenAI format: tool_calls[].function.name
+        if let Some(ref func) = self.function {
+            if let Some(ref name) = func.name {
+                return Some(name.clone());
+            }
+        }
+        // Fallback: direct name field
+        self.name.clone()
+    }
+
+    /// Extract arguments with fallback logic and type conversion
+    fn function_arguments(&self) -> Option<String> {
+        // Standard OpenAI format: tool_calls[].function.arguments (string)
+        if let Some(ref func) = self.function {
+            if let Some(ref args) = func.arguments {
+                return Some(args.clone());
+            }
+        }
+        // Fallback: direct arguments field
+        if let Some(ref args) = self.arguments {
+            return Some(args.clone());
+        }
+        // Compatibility: Some providers return parameters as object instead of string
+        if let Some(ref params) = self.parameters {
+            return serde_json::to_string(params).ok();
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Function {
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
     arguments: Option<String>,
 }
 
@@ -293,11 +510,15 @@ struct NativeChatRequest {
 struct NativeMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Raw reasoning content from thinking models; pass-through for providers
+    /// that require it in assistant tool-call history messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -495,6 +716,42 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
     })
 }
 
+fn normalize_responses_role(role: &str) -> &'static str {
+    match role {
+        "assistant" | "tool" => "assistant",
+        _ => "user",
+    }
+}
+
+fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<ResponsesInput>) {
+    let mut instructions_parts = Vec::new();
+    let mut input = Vec::new();
+
+    for message in messages {
+        if message.content.trim().is_empty() {
+            continue;
+        }
+
+        if message.role == "system" {
+            instructions_parts.push(message.content.clone());
+            continue;
+        }
+
+        input.push(ResponsesInput {
+            role: normalize_responses_role(&message.role).to_string(),
+            content: message.content.clone(),
+        });
+    }
+
+    let instructions = if instructions_parts.is_empty() {
+        None
+    } else {
+        Some(instructions_parts.join("\n\n"))
+    };
+
+    (instructions, input)
+}
+
 fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
@@ -565,17 +822,21 @@ impl OpenAiCompatibleProvider {
     async fn chat_via_responses(
         &self,
         credential: &str,
-        system_prompt: Option<&str>,
-        message: &str,
+        messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API fallback requires at least one non-system message",
+                self.name
+            );
+        }
+
         let request = ResponsesRequest {
             model: model.to_string(),
-            input: vec![ResponsesInput {
-                role: "user".to_string(),
-                content: message.to_string(),
-            }],
-            instructions: system_prompt.map(str::to_string),
+            input,
+            instructions,
             stream: Some(false),
         };
 
@@ -618,6 +879,33 @@ impl OpenAiCompatibleProvider {
         })
     }
 
+    fn to_message_content(role: &str, content: &str) -> MessageContent {
+        if role != "user" {
+            return MessageContent::Text(content.to_string());
+        }
+
+        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return MessageContent::Text(content.to_string());
+        }
+
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed_text = cleaned_text.trim();
+        if !trimmed_text.is_empty() {
+            parts.push(MessagePart::Text {
+                text: trimmed_text.to_string(),
+            });
+        }
+
+        for image_ref in image_refs {
+            parts.push(MessagePart::ImageUrl {
+                image_url: ImageUrlPart { url: image_ref },
+            });
+        }
+
+        MessageContent::Parts(parts)
+    }
+
     fn convert_messages_for_native(messages: &[ChatMessage]) -> Vec<NativeMessage> {
         messages
             .iter()
@@ -640,11 +928,19 @@ impl OpenAiCompatibleProvider {
                                             name: Some(tc.name),
                                             arguments: Some(tc.arguments),
                                         }),
+                                        name: None,
+                                        arguments: None,
+                                        parameters: None,
                                     })
                                     .collect::<Vec<_>>();
 
                                 let content = value
                                     .get("content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|value| MessageContent::Text(value.to_string()));
+
+                                let reasoning_content = value
+                                    .get("reasoning_content")
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
 
@@ -653,6 +949,7 @@ impl OpenAiCompatibleProvider {
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
+                                    reasoning_content,
                                 };
                             }
                         }
@@ -668,23 +965,25 @@ impl OpenAiCompatibleProvider {
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .or_else(|| Some(message.content.clone()));
+                            .map(|value| MessageContent::Text(value.to_string()))
+                            .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
                             tool_call_id,
                             tool_calls: None,
+                            reasoning_content: None,
                         };
                     }
                 }
 
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(message.content.clone()),
+                    content: Some(Self::to_message_content(&message.role, &message.content)),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }
             })
             .collect()
@@ -718,25 +1017,39 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+        let text = message.effective_content_optional();
+        let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
             .into_iter()
             .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
+                let name = tc.function_name()?;
+                let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
+                let normalized_arguments =
+                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
+                        arguments
+                    } else {
+                        tracing::warn!(
+                            function = %name,
+                            arguments = %arguments,
+                            "Invalid JSON in native tool-call arguments, using empty object"
+                        );
+                        "{}".to_string()
+                    };
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
-                    arguments,
+                    arguments: normalized_arguments,
                 })
             })
             .collect::<Vec<_>>();
 
         ProviderChatResponse {
-            text: message.content,
+            text,
             tool_calls,
+            usage: None,
+            reasoning_content,
         }
     }
 
@@ -767,6 +1080,7 @@ impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
+            vision: self.supports_vision,
         }
     }
 
@@ -786,17 +1100,27 @@ impl Provider for OpenAiCompatibleProvider {
 
         let mut messages = Vec::new();
 
-        if let Some(sys) = system_prompt {
+        if self.merge_system_into_user {
+            let content = match system_prompt {
+                Some(sys) => format!("{sys}\n\n{message}"),
+                None => message.to_string(),
+            };
             messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
+                role: "user".to_string(),
+                content: Self::to_message_content("user", &content),
+            });
+        } else {
+            if let Some(sys) = system_prompt {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: MessageContent::Text(sys.to_string()),
+                });
+            }
+            messages.push(Message {
+                role: "user".to_string(),
+                content: Self::to_message_content("user", message),
             });
         }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -809,10 +1133,40 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
 
-        let response = self
+        let mut fallback_messages = Vec::new();
+        if let Some(system_prompt) = system_prompt {
+            fallback_messages.push(ChatMessage::system(system_prompt));
+        }
+        fallback_messages.push(ChatMessage::user(message));
+        let fallback_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(&fallback_messages)
+        } else {
+            fallback_messages
+        };
+
+        let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, &fallback_messages, model)
+                        .await
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
+                            )
+                        });
+                }
+
+                return Err(chat_error.into());
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -821,7 +1175,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, system_prompt, message, model)
+                    .chat_via_responses(credential, &fallback_messages, model)
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -873,11 +1227,16 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let api_messages: Vec<Message> = messages
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: Self::to_message_content(&m.role, &m.content),
             })
             .collect();
 
@@ -891,35 +1250,44 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = self
+        let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, &effective_messages, model)
+                        .await
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
+                            )
+                        });
+                }
+
+                return Err(chat_error.into());
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
 
             // Mirror chat_with_system: 404 may mean this provider uses the Responses API
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                // Extract system prompt and last user message for responses fallback
-                let system = messages.iter().find(|m| m.role == "system");
-                let last_user = messages.iter().rfind(|m| m.role == "user");
-                if let Some(user_msg) = last_user {
-                    return self
-                        .chat_via_responses(
-                            credential,
-                            system.map(|m| m.content.as_str()),
-                            &user_msg.content,
-                            model,
+                return self
+                    .chat_via_responses(credential, &effective_messages, model)
+                    .await
+                    .map_err(|responses_err| {
+                        anyhow::anyhow!(
+                            "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
+                            self.name
                         )
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
+                    });
             }
 
             return Err(super::api_error(&self.name, response).await);
@@ -965,11 +1333,16 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let api_messages: Vec<Message> = messages
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: Self::to_message_content(&m.role, &m.content),
             })
             .collect();
 
@@ -991,10 +1364,26 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = self
+        let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    "{} native tool call transport failed: {error}; falling back to history path",
+                    self.name
+                );
+                let text = self.chat_with_history(messages, model, temperature).await?;
+                return Ok(ProviderChatResponse {
+                    text: Some(text),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+        };
 
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
@@ -1002,6 +1391,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let choice = chat_response
             .choices
             .into_iter()
@@ -1009,6 +1402,7 @@ impl Provider for OpenAiCompatibleProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
         let text = choice.message.effective_content_optional();
+        let reasoning_content = choice.message.reasoning_content;
         let tool_calls = choice
             .message
             .tool_calls
@@ -1026,7 +1420,12 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            usage,
+            reasoning_content,
+        })
     }
 
     async fn chat(
@@ -1043,9 +1442,14 @@ impl Provider for OpenAiCompatibleProvider {
         })?;
 
         let tools = Self::convert_tool_specs(request.tools);
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(request.messages),
+            messages: Self::convert_messages_for_native(&effective_messages),
             temperature,
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -1053,10 +1457,38 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&native_request), credential)
+        let response = match self
+            .apply_auth_header(
+                self.http_client().post(&url).json(&native_request),
+                credential,
+            )
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, &effective_messages, model)
+                        .await
+                        .map(|text| ProviderChatResponse {
+                            text: Some(text),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        })
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
+                            )
+                        });
+                }
+
+                return Err(chat_error.into());
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1072,38 +1504,37 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
                 });
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                let system = request.messages.iter().find(|m| m.role == "system");
-                let last_user = request.messages.iter().rfind(|m| m.role == "user");
-                if let Some(user_msg) = last_user {
-                    return self
-                        .chat_via_responses(
-                            credential,
-                            system.map(|m| m.content.as_str()),
-                            &user_msg.content,
-                            model,
+                return self
+                    .chat_via_responses(credential, &effective_messages, model)
+                    .await
+                    .map(|text| ProviderChatResponse {
+                        text: Some(text),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    })
+                    .map_err(|responses_err| {
+                        anyhow::anyhow!(
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            self.name
                         )
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
+                    });
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
         let native_response: ApiChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
@@ -1111,7 +1542,9 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1148,12 +1581,12 @@ impl Provider for OpenAiCompatibleProvider {
         if let Some(sys) = system_prompt {
             messages.push(Message {
                 role: "system".to_string(),
-                content: sys.to_string(),
+                content: MessageContent::Text(sys.to_string()),
             });
         }
         messages.push(Message {
             role: "user".to_string(),
-            content: message.to_string(),
+            content: Self::to_message_content("user", message),
         });
 
         let request = ApiChatRequest {
@@ -1293,11 +1726,11 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
+                    content: MessageContent::Text("You are ZeroClaw".to_string()),
                 },
                 Message {
                     role: "user".to_string(),
-                    content: "hello".to_string(),
+                    content: MessageContent::Text("hello".to_string()),
                 },
             ],
             temperature: 0.4,
@@ -1429,6 +1862,87 @@ mod tests {
         assert_eq!(
             extract_responses_text(response).as_deref(),
             Some("Fallback text")
+        );
+    }
+
+    #[test]
+    fn build_responses_prompt_preserves_multi_turn_history() {
+        let messages = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user("step 1"),
+            ChatMessage::assistant("ack 1"),
+            ChatMessage::tool("{\"result\":\"ok\"}"),
+            ChatMessage::user("step 2"),
+        ];
+
+        let (instructions, input) = build_responses_prompt(&messages);
+
+        assert_eq!(instructions.as_deref(), Some("policy"));
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(input[0].content, "step 1");
+        assert_eq!(input[1].role, "assistant");
+        assert_eq!(input[1].content, "ack 1");
+        assert_eq!(input[2].role, "assistant");
+        assert_eq!(input[2].content, "{\"result\":\"ok\"}");
+        assert_eq!(input[3].role, "user");
+        assert_eq!(input[3].content, "step 2");
+    }
+
+    #[tokio::test]
+    async fn chat_via_responses_requires_non_system_message() {
+        let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
+        let err = provider
+            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
+            .await
+            .expect_err("system-only fallback payload should fail");
+
+        assert!(err
+            .to_string()
+            .contains("requires at least one non-system message"));
+    }
+
+    #[test]
+    fn tool_call_function_name_falls_back_to_top_level_name() {
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "name": "memory_recall",
+            "arguments": "{\"query\":\"latest roadmap\"}"
+        }))
+        .unwrap();
+
+        assert_eq!(call.function_name().as_deref(), Some("memory_recall"));
+    }
+
+    #[test]
+    fn tool_call_function_arguments_falls_back_to_parameters_object() {
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "name": "shell",
+            "parameters": {"command": "pwd"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            call.function_arguments().as_deref(),
+            Some("{\"command\":\"pwd\"}")
+        );
+    }
+
+    #[test]
+    fn tool_call_function_arguments_prefers_nested_function_field() {
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "name": "ignored_name",
+            "arguments": "{\"query\":\"ignored\"}",
+            "function": {
+                "name": "memory_recall",
+                "arguments": "{\"query\":\"preferred\"}"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(call.function_name().as_deref(), Some("memory_recall"));
+        assert_eq!(
+            call.function_arguments().as_deref(),
+            Some("{\"query\":\"preferred\"}")
         );
     }
 
@@ -1634,6 +2148,9 @@ mod tests {
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
+                name: None,
+                arguments: None,
+                parameters: None,
             }]),
             reasoning_content: None,
         };
@@ -1654,7 +2171,52 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
-        assert_eq!(converted[0].content.as_deref(), Some("done"));
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn flatten_system_messages_merges_into_first_user() {
+        let input = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::assistant("ack"),
+            ChatMessage::system("delivery rules"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("post-user"),
+        ];
+
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0].role, "assistant");
+        assert_eq!(output[0].content, "ack");
+        assert_eq!(output[1].role, "user");
+        assert_eq!(output[1].content, "core policy\n\ndelivery rules\n\nhello");
+        assert_eq!(output[2].role, "assistant");
+        assert_eq!(output[2].content, "post-user");
+        assert!(output.iter().all(|m| m.role != "system"));
+    }
+
+    #[test]
+    fn flatten_system_messages_inserts_user_when_missing() {
+        let input = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::assistant("ack"),
+        ];
+
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].role, "user");
+        assert_eq!(output[0].content, "core policy");
+        assert_eq!(output[1].role, "assistant");
+        assert_eq!(output[1].content, "ack");
+    }
+
+    #[test]
+    fn strip_think_tags_drops_unclosed_block_suffix() {
+        let input = "visible<think>hidden";
+        assert_eq!(strip_think_tags(input), "visible");
     }
 
     #[test]
@@ -1710,6 +2272,48 @@ mod tests {
         let p = make_provider("test", "https://example.com", None);
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
+        assert!(!caps.vision);
+    }
+
+    #[test]
+    fn capabilities_reports_vision_for_qwen_compatible_provider() {
+        let p = OpenAiCompatibleProvider::new_with_vision(
+            "Qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+            true,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
+    }
+
+    #[test]
+    fn to_message_content_converts_image_markers_to_openai_parts() {
+        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
+        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+            "user", content,
+        ))
+        .unwrap();
+        let parts = value
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Describe this");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn to_message_content_keeps_plain_text_for_non_user_roles() {
+        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+            "system",
+            "You are a helpful assistant.",
+        ))
+        .unwrap();
+        assert_eq!(value, serde_json::json!("You are a helpful assistant."));
     }
 
     #[test]
@@ -1752,7 +2356,7 @@ mod tests {
             model: "test-model".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: "What is the weather?".to_string(),
+                content: MessageContent::Text("What is the weather?".to_string()),
             }],
             temperature: 0.7,
             stream: Some(false),
@@ -1876,6 +2480,56 @@ mod tests {
         assert!(msg.tool_calls.is_none());
     }
 
+    #[test]
+    fn flatten_system_messages_merges_into_first_user_and_removes_system_roles() {
+        let messages = vec![
+            ChatMessage::system("System A"),
+            ChatMessage::assistant("Earlier assistant turn"),
+            ChatMessage::system("System B"),
+            ChatMessage::user("User turn"),
+            ChatMessage::tool(r#"{"ok":true}"#),
+        ];
+
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        assert_eq!(flattened.len(), 3);
+        assert_eq!(flattened[0].role, "assistant");
+        assert_eq!(
+            flattened[1].content,
+            "System A\n\nSystem B\n\nUser turn".to_string()
+        );
+        assert_eq!(flattened[1].role, "user");
+        assert_eq!(flattened[2].role, "tool");
+        assert!(!flattened.iter().any(|m| m.role == "system"));
+    }
+
+    #[test]
+    fn flatten_system_messages_inserts_synthetic_user_when_no_user_exists() {
+        let messages = vec![
+            ChatMessage::assistant("Assistant only"),
+            ChatMessage::system("Synthetic system"),
+        ];
+
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].role, "user");
+        assert_eq!(flattened[0].content, "Synthetic system");
+        assert_eq!(flattened[1].role, "assistant");
+    }
+
+    #[test]
+    fn strip_think_tags_removes_multiple_blocks_with_surrounding_text() {
+        let input = "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done";
+        let output = strip_think_tags(input);
+        assert_eq!(output, "Answer A  and B  done");
+    }
+
+    #[test]
+    fn strip_think_tags_drops_tail_for_unclosed_block() {
+        let input = "Visible<think>hidden tail";
+        let output = strip_think_tags(input);
+        assert_eq!(output, "Visible");
+    }
+
     // ----------------------------------------------------------
     // Reasoning model fallback tests (reasoning_content)
     // ----------------------------------------------------------
@@ -1915,6 +2569,18 @@ mod tests {
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), "Normal response");
+    }
+
+    #[test]
+    fn reasoning_content_used_when_content_only_think_tags() {
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Fallback text");
+        assert_eq!(
+            msg.effective_content_optional().as_deref(),
+            Some("Fallback text")
+        );
     }
 
     #[test]
@@ -1974,5 +2640,138 @@ mod tests {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn api_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 150, "completion_tokens": 60}
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(150));
+        assert_eq!(usage.completion_tokens, Some(60));
+    }
+
+    #[test]
+    fn api_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_native_response_captures_reasoning_content() {
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: Some("thinking step".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_1".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+            }]),
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_none_reasoning_content_for_normal_model() {
+        let message = ResponseMessage {
+            content: Some("hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_round_trips_reasoning_content() {
+        // Simulate stored assistant history JSON that includes reasoning_content
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "Let me think about this..."
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Let me think about this...")
+        );
+        assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_no_reasoning_content_when_absent() {
+        // Normal model history without reasoning_content key
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
+        // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
+        let msg_without = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg_without).unwrap();
+        assert!(
+            !json.contains("reasoning_content"),
+            "reasoning_content should be omitted when None"
+        );
+
+        let msg_with = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: Some("thinking...".to_string()),
+        };
+        let json = serde_json::to_string(&msg_with).unwrap();
+        assert!(
+            json.contains("reasoning_content"),
+            "reasoning_content should be present when Some"
+        );
+        assert!(json.contains("thinking..."));
     }
 }

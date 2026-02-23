@@ -11,11 +11,20 @@ const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Severity {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
     Ok,
     Warn,
     Error,
+}
+
+/// Structured diagnostic result for programmatic consumption (web dashboard, API).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiagResult {
+    pub severity: Severity,
+    pub category: String,
+    pub message: String,
 }
 
 struct DiagItem {
@@ -54,40 +63,65 @@ impl DiagItem {
             Severity::Error => "❌",
         }
     }
+
+    fn into_result(self) -> DiagResult {
+        DiagResult {
+            severity: self.severity,
+            category: self.category.to_string(),
+            message: self.message,
+        }
+    }
 }
 
-// ── Public entry point ───────────────────────────────────────────
+// ── Public entry points ──────────────────────────────────────────
 
-pub fn run(config: &Config) -> Result<()> {
+/// Run diagnostics and return structured results (for API/web dashboard).
+pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     let mut items: Vec<DiagItem> = Vec::new();
 
     check_config_semantics(config, &mut items);
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
+    check_cli_tools(&mut items);
+
+    items.into_iter().map(DiagItem::into_result).collect()
+}
+
+/// Run diagnostics and print human-readable report to stdout.
+pub fn run(config: &Config) -> Result<()> {
+    let results = diagnose(config);
 
     // Print report
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
 
     let mut current_cat = "";
-    for item in &items {
+    for item in &results {
         if item.category != current_cat {
-            current_cat = item.category;
+            current_cat = &item.category;
             println!("  [{current_cat}]");
         }
-        println!("    {} {}", item.icon(), item.message);
+        let icon = match item.severity {
+            Severity::Ok => "✅",
+            Severity::Warn => "⚠️ ",
+            Severity::Error => "❌",
+        };
+        println!("    {} {}", icon, item.message);
     }
 
-    let errors = items
+    let errors = results
         .iter()
         .filter(|i| i.severity == Severity::Error)
         .count();
-    let warns = items
+    let warns = results
         .iter()
         .filter(|i| i.severity == Severity::Warn)
         .count();
-    let oks = items.iter().filter(|i| i.severity == Severity::Ok).count();
+    let oks = results
+        .iter()
+        .filter(|i| i.severity == Severity::Ok)
+        .count();
 
     println!();
     println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
@@ -147,7 +181,11 @@ fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: bool) -> Result<()> {
+pub async fn run_models(
+    config: &Config,
+    provider_override: Option<&str>,
+    use_cache: bool,
+) -> Result<()> {
     let targets = doctor_model_targets(provider_override);
 
     if targets.is_empty() {
@@ -174,7 +212,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache) {
+        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache).await {
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");
@@ -222,6 +260,88 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
         anyhow::bail!("Model probe failed for target provider")
     }
 
+    Ok(())
+}
+
+pub fn run_traces(
+    config: &Config,
+    id: Option<&str>,
+    event_filter: Option<&str>,
+    contains: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let path = crate::observability::runtime_trace::resolve_trace_path(
+        &config.observability,
+        &config.workspace_dir,
+    );
+
+    if let Some(target_id) = id.map(str::trim).filter(|value| !value.is_empty()) {
+        match crate::observability::runtime_trace::find_event_by_id(&path, target_id)? {
+            Some(event) => {
+                println!("{}", serde_json::to_string_pretty(&event)?);
+            }
+            None => {
+                println!(
+                    "No runtime trace event found for id '{}' (path: {}).",
+                    target_id,
+                    path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if !path.exists() {
+        println!(
+            "Runtime trace file not found: {}.\n\
+             Enable [observability] runtime_trace_mode = \"rolling\" or \"full\", then reproduce the issue.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let safe_limit = limit.max(1);
+    let events = crate::observability::runtime_trace::load_events(
+        &path,
+        safe_limit,
+        event_filter,
+        contains,
+    )?;
+
+    if events.is_empty() {
+        println!(
+            "No runtime trace events matched query (path: {}).",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    println!("Runtime traces (newest first)");
+    println!("Path: {}", path.display());
+    println!(
+        "Filters: event={} contains={} limit={}",
+        event_filter.unwrap_or("*"),
+        contains.unwrap_or("*"),
+        safe_limit
+    );
+    println!();
+
+    for event in events {
+        let success = match event.success {
+            Some(true) => "ok",
+            Some(false) => "fail",
+            None => "-",
+        };
+        let message = event.message.unwrap_or_default();
+        let preview = truncate_for_display(&message, 80);
+        println!(
+            "- {} | {} | {} | {} | {}",
+            event.timestamp, event.id, event.event_type, success, preview
+        );
+    }
+
+    println!();
+    println!("Use `zeroclaw doctor traces --id <trace-id>` to inspect a full event payload.");
     Ok(())
 }
 
@@ -344,18 +464,61 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
+    // Embedding routes validation
+    for route in &config.embedding_routes {
+        if route.hint.trim().is_empty() {
+            items.push(DiagItem::warn(cat, "embedding route with empty hint"));
+        }
+        if let Some(reason) = embedding_provider_validation_error(&route.provider) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "embedding route \"{}\" uses invalid provider \"{}\": {}",
+                    route.hint, route.provider, reason
+                ),
+            ));
+        }
+        if route.model.trim().is_empty() {
+            items.push(DiagItem::warn(
+                cat,
+                format!("embedding route \"{}\" has empty model", route.hint),
+            ));
+        }
+        if route.dimensions.is_some_and(|value| value == 0) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "embedding route \"{}\" has invalid dimensions=0",
+                    route.hint
+                ),
+            ));
+        }
+    }
+
+    if let Some(hint) = config
+        .memory
+        .embedding_model
+        .strip_prefix("hint:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !config
+            .embedding_routes
+            .iter()
+            .any(|route| route.hint.trim() == hint)
+        {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "memory.embedding_model uses hint \"{hint}\" but no matching [[embedding_routes]] entry exists"
+                ),
+            ));
+        }
+    }
+
     // Channel: at least one configured
     let cc = &config.channels_config;
-    let has_channel = cc.telegram.is_some()
-        || cc.discord.is_some()
-        || cc.slack.is_some()
-        || cc.imessage.is_some()
-        || cc.matrix.is_some()
-        || cc.whatsapp.is_some()
-        || cc.email.is_some()
-        || cc.irc.is_some()
-        || cc.lark.is_some()
-        || cc.webhook.is_some();
+    let has_channel = cc.channels().iter().any(|(_, ok)| *ok);
 
     if has_channel {
         items.push(DiagItem::ok(cat, "at least one channel configured"));
@@ -393,6 +556,31 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .unwrap_or("invalid provider")
                 .into(),
         ),
+    }
+}
+
+fn embedding_provider_validation_error(name: &str) -> Option<String> {
+    let normalized = name.trim();
+    if normalized.eq_ignore_ascii_case("none") || normalized.eq_ignore_ascii_case("openai") {
+        return None;
+    }
+
+    let Some(url) = normalized.strip_prefix("custom:") else {
+        return Some("supported values: none, openai, custom:<url>".into());
+    };
+
+    let url = url.trim();
+    if url.is_empty() {
+        return Some("custom provider requires a non-empty URL after 'custom:'".into());
+    }
+
+    match reqwest::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => None,
+        Ok(parsed) => Some(format!(
+            "custom provider URL must use http/https, got '{}'",
+            parsed.scheme()
+        )),
+        Err(err) => Some(format!("invalid custom provider URL: {err}")),
     }
 }
 
@@ -673,6 +861,32 @@ fn check_environment(items: &mut Vec<DiagItem>) {
     check_command_available("curl", &["--version"], cat, items);
 }
 
+fn check_cli_tools(items: &mut Vec<DiagItem>) {
+    let cat = "cli-tools";
+
+    let discovered = crate::tools::cli_discovery::discover_cli_tools(&[], &[]);
+
+    if discovered.is_empty() {
+        items.push(DiagItem::warn(cat, "No CLI tools found in PATH"));
+    } else {
+        for cli in &discovered {
+            let version_info = cli
+                .version
+                .as_deref()
+                .map(|v| truncate_for_display(v, COMMAND_VERSION_PREVIEW_CHARS))
+                .unwrap_or_else(|| "unknown version".to_string());
+            items.push(DiagItem::ok(
+                cat,
+                format!("{} ({}) — {}", cli.name, cli.category, version_info),
+            ));
+        }
+        items.push(DiagItem::ok(
+            cat,
+            format!("{} CLI tools discovered", discovered.len()),
+        ));
+    }
+}
+
 fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &mut Vec<DiagItem>) {
     match std::process::Command::new(cmd)
         .args(args)
@@ -892,6 +1106,62 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_warns_empty_embedding_route_model() {
+        let mut config = Config::default();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: String::new(),
+            dimensions: Some(1536),
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("embedding route \"semantic\" has empty model")
+        });
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_invalid_embedding_route_provider() {
+        let mut config = Config::default();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "groq".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items
+            .iter()
+            .find(|item| item.message.contains("uses invalid provider \"groq\""));
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_missing_embedding_hint_target() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".into();
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("no matching [[embedding_routes]] entry exists")
+        });
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
     fn environment_check_finds_git() {
         let mut items = Vec::new();
         check_environment(&mut items);
@@ -910,8 +1180,8 @@ mod tests {
 
     #[test]
     fn truncate_for_display_preserves_utf8_boundaries() {
-        let preview = truncate_for_display("版本号-alpha-build", 3);
-        assert_eq!(preview, "版本号…");
+        let preview = truncate_for_display("🙂example-alpha-build", 3);
+        assert_eq!(preview, "🙂ex…");
     }
 
     #[test]
@@ -939,6 +1209,9 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
         config.agents.insert(
@@ -950,6 +1223,9 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
 
